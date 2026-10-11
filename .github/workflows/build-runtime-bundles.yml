@@ -95,6 +95,7 @@ jobs:
           split -d -a 3 -b 1800M "$RUNNER_TEMP/cosyvoice-models.tar.gz" "$ASSET_DIR/cosyvoice-models.part-"
           rm "$RUNNER_TEMP/cosyvoice-models.tar.gz"
           curl -fsSL 'https://raw.githubusercontent.com/duixcom/Duix-Avatar/1328feb5871448c8fa3d0e45b3bbc87e7c1d458a/LICENSE' -o "$ASSET_DIR/DUIX-LICENSE.txt"
+          cp "$RUNNER_TEMP/CosyVoice/LICENSE" "$ASSET_DIR/COSYVOICE-LICENSE.txt"
           printf '%s\n' 'DUIX.COM is licensed under the DUIX.COM Community License, Copyright © DUIX.COM Platforms, Inc. All Rights Reserved.' > "$ASSET_DIR/DUIX-NOTICE.txt"
           curl -fsSL 'https://www.apache.org/licenses/LICENSE-2.0.txt' -o "$ASSET_DIR/COSYVOICE-APACHE-2.0.txt"
           cat > "$ASSET_DIR/THIRD-PARTY-NOTICE.md" <<'EOF'
@@ -120,7 +121,9 @@ jobs:
               parts=sorted(root.glob(prefix+'.part-*'))
               full=hashlib.sha256(); size=0
               for p in parts:
-                  h,_=digest(p); data=p.read_bytes(); full.update(data); size+=len(data)
+                  with p.open('rb') as stream:
+                      for block in iter(lambda:stream.read(8*1024*1024),b''): full.update(block)
+                  size+=p.stat().st_size
               return {'image':image,'parts':[p.name for p in parts],'size':size,'sha256':full.hexdigest()}
           duix=bundle('duix-image','guiji2025/duix.avatar:0.1.0_sdk_slim')
           cosy=bundle('cosyvoice-image','aurora/cosyvoice2-cu128:0.1.4')
@@ -128,8 +131,6 @@ jobs:
           assets=[]
           for p in sorted(root.iterdir()):
               if p.name=='manifest.json' or not p.is_file(): continue
-              h,size=digest(p); assets.append({'name':p.name,'size':size,'sha256':h})
-          for p in sorted(root.glob('*.part-*')):
               h,size=digest(p); assets.append({'name':p.name,'size':size,'sha256':h})
           manifest={'product':'AuroraStudio','version':'0.1.4',
                     'cosyvoice_commit':os.environ['COSYVOICE_COMMIT'],
