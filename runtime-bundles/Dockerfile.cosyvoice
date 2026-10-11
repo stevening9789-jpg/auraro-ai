@@ -1,0 +1,17 @@
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
+ARG COSYVOICE_COMMIT
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/opt/CosyVoice:/opt/CosyVoice/third_party/Matcha-TTS
+LABEL org.opencontainers.image.title="Aurora CosyVoice2 Runtime" \
+      org.opencontainers.image.revision="${COSYVOICE_COMMIT}"
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential ffmpeg git git-lfs libsox-dev sox unzip \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/CosyVoice
+COPY . /opt/CosyVoice
+RUN sed -E '/^(torch==|torchaudio==|deepspeed==|onnxruntime-gpu==|tensorrt-cu12|openai-whisper==|fastapi-cli==|gdown==|gradio==|grpcio==|grpcio-tools==|tensorboard==)/d' requirements.txt > /tmp/requirements-runtime.txt \
+    && printf '\nonnxruntime==1.18.0\npython-multipart==0.0.12\n' >> /tmp/requirements-runtime.txt \
+    && pip install --no-cache-dir -r /tmp/requirements-runtime.txt \
+    && pip install --no-cache-dir openai-whisper==20250625 gdown==5.2.0
+EXPOSE 50000
