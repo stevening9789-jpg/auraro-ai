@@ -1,0 +1,132 @@
+name: Build Aurora 0.1.4 runtime bundles
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Draft GitHub Release tag for the verified runtime bundles
+        required: true
+        default: aurora-runtime-v0.1.4-rc1
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out bundle recipes
+        uses: actions/checkout@v4
+      - name: Install archive tools
+        run: sudo apt-get update && sudo apt-get install -y zstd
+      - name: Fetch pinned upstream sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/FunAudioLLM/CosyVoice.git "$RUNNER_TEMP/CosyVoice"
+          git -C "$RUNNER_TEMP/CosyVoice" checkout 074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc
+          echo "COSYVOICE_COMMIT=074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc" >> "$GITHUB_ENV"
+          echo "ASSET_DIR=$RUNNER_TEMP/aurora-runtime-assets" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/aurora-runtime-assets"
+      - name: Build and verify CosyVoice image for RTX 30 series
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --pull --build-arg COSYVOICE_COMMIT="$COSYVOICE_COMMIT" \
+            -f runtime-bundles/Dockerfile.cosyvoice \
+            -t aurora/cosyvoice2-cu128:0.1.4 "$RUNNER_TEMP/CosyVoice"
+          docker run --rm --entrypoint python aurora/cosyvoice2-cu128:0.1.4 -c \
+            "import torch; a=torch.cuda.get_arch_list(); print(a); assert 'sm_86' in a, 'PyTorch runtime lacks RTX 3060 (sm_86) kernels'"
+      - name: Pull the published DuiX image by immutable digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull wupeiqi/duix@sha256:f8298e12e12c29b24c5d428a860d7db3f1ff3fa0ced87447da9b072e387ef341
+          docker tag wupeiqi/duix@sha256:f8298e12e12c29b24c5d428a860d7db3f1ff3fa0ced87447da9b072e387ef341 wupeiqi/duix:latest
+          docker image inspect wupeiqi/duix:latest
+      - name: Export runtime images as split GitHub assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker save aurora/cosyvoice2-cu128:0.1.4 | gzip -1 > "$ASSET_DIR/cosyvoice-image.tar.gz"
+          docker image rm aurora/cosyvoice2-cu128:0.1.4
+          docker save wupeiqi/duix:latest | gzip -1 > "$ASSET_DIR/duix-image.tar.gz"
+          for name in cosyvoice-image duix-image; do
+            split -d -a 3 -b 1800M "$ASSET_DIR/$name.tar.gz" "$ASSET_DIR/$name.part-"
+            rm "$ASSET_DIR/$name.tar.gz"
+          done
+      - name: Download pinned CosyVoice2 model files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check huggingface_hub==0.34.4
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          from huggingface_hub import snapshot_download
+          target = Path(os.environ['RUNNER_TEMP']) / 'CosyVoice2-0.5B'
+          revision = 'eec1ae6c79877dbd9379285cf8789c9e0879293d'
+          required = [
+              'campplus.onnx','configuration.json','cosyvoice2.yaml','flow.pt','hift.pt','llm.pt',
+              'speech_tokenizer_v2.onnx','CosyVoice-BlankEN/config.json',
+              'CosyVoice-BlankEN/generation_config.json','CosyVoice-BlankEN/merges.txt',
+              'CosyVoice-BlankEN/model.safetensors','CosyVoice-BlankEN/tokenizer_config.json',
+              'CosyVoice-BlankEN/vocab.json'
+          ]
+          snapshot_download(repo_id='FunAudioLLM/CosyVoice2-0.5B', revision=revision,
+                            local_dir=str(target), allow_patterns=required, max_workers=8)
+          records = []
+          for rel in required:
+              p = target / rel
+              h = hashlib.sha256()
+              with p.open('rb') as f:
+                  for block in iter(lambda: f.read(8 * 1024 * 1024), b''): h.update(block)
+              records.append({'path': rel, 'size': p.stat().st_size, 'sha256': h.hexdigest()})
+          (Path(os.environ['RUNNER_TEMP']) / 'cosyvoice-model-manifest.json').write_text(
+              json.dumps({'repo':'FunAudioLLM/CosyVoice2-0.5B','revision':revision,'files':records},
+                         ensure_ascii=False, indent=2), encoding='utf-8')
+          (Path(os.environ['RUNNER_TEMP']) / 'cosyvoice-model-files.txt').write_text(
+              '\n'.join(required) + '\n', encoding='utf-8')
+          PY
+          tar -C "$RUNNER_TEMP/CosyVoice2-0.5B" -czf "$ASSET_DIR/cosyvoice-models.tar.gz" -T "$RUNNER_TEMP/cosyvoice-model-files.txt"
+          cp "$RUNNER_TEMP/cosyvoice-model-manifest.json" "$ASSET_DIR/"
+          split -d -a 3 -b 1800M "$ASSET_DIR/cosyvoice-models.tar.gz" "$ASSET_DIR/cosyvoice-models.part-"
+          rm "$ASSET_DIR/cosyvoice-models.tar.gz"
+      - name: Write asset size and checksum manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ['ASSET_DIR'])
+          assets = []
+          for p in sorted(root.glob('*.part-*')):
+              h = hashlib.sha256()
+              with p.open('rb') as f:
+                  for block in iter(lambda: f.read(8 * 1024 * 1024), b''): h.update(block)
+              assets.append({'name':p.name,'size':p.stat().st_size,'sha256':h.hexdigest()})
+          manifest = {'product':'AuroraStudio','version':'0.1.4','cosyvoice_commit':os.environ['COSYVOICE_COMMIT'],
+                      'duix_image':'wupeiqi/duix:latest',
+                      'duix_digest':'sha256:f8298e12e12c29b24c5d428a860d7db3f1ff3fa0ced87447da9b072e387ef341',
+                      'cosyvoice_image':'aurora/cosyvoice2-cu128:0.1.4',
+                      'cosyvoice_model_manifest':'cosyvoice-model-manifest.json','assets':assets}
+          (root/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          sums = ''.join(f"{x['sha256']}  {x['name']}\n" for x in assets)
+          (root/'SHA256SUMS.txt').write_text(sums,encoding='ascii')
+          PY
+      - name: Publish draft runtime release for acceptance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/release-notes.md" <<'EOF'
+          Aurora 0.1.4 runtime bundle acceptance assets.
+
+          Includes a pinned DuiX image, a CosyVoice2 runtime image, and the required CosyVoice2 model files. Assets are split below 2 GB each and include SHA-256 metadata.
+
+          This is a draft acceptance release. Validate installation and real RTX 3060 inference before publishing it for customers.
+          EOF
+          gh release create "$RELEASE_TAG" "$ASSET_DIR"/* --draft --title "极光片场运行组件 0.1.4 验收包" --notes-file "$RUNNER_TEMP/release-notes.md" --target "$GITHUB_SHA"
