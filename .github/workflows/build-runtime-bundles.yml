@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Draft GitHub Release tag for the verified runtime bundles
+        description: Draft GitHub Release tag for runtime acceptance assets
         required: true
         default: aurora-runtime-v0.1.4-rc1
 permissions:
@@ -19,12 +19,13 @@ jobs:
         uses: actions/checkout@v4
       - name: Install archive tools
         run: sudo apt-get update && sudo apt-get install -y zstd
-      - name: Fetch pinned upstream sources
+      - name: Fetch pinned CosyVoice source
         shell: bash
         run: |
           set -euo pipefail
-          git clone --filter=blob:none https://github.com/FunAudioLLM/CosyVoice.git "$RUNNER_TEMP/CosyVoice"
+          git clone --filter=blob:none --recurse-submodules https://github.com/FunAudioLLM/CosyVoice.git "$RUNNER_TEMP/CosyVoice"
           git -C "$RUNNER_TEMP/CosyVoice" checkout 074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc
+          git -C "$RUNNER_TEMP/CosyVoice" submodule update --init --recursive
           echo "COSYVOICE_COMMIT=074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc" >> "$GITHUB_ENV"
           echo "ASSET_DIR=$RUNNER_TEMP/aurora-runtime-assets" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/aurora-runtime-assets"
@@ -32,30 +33,32 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker build --pull --build-arg COSYVOICE_COMMIT="$COSYVOICE_COMMIT" \
-            -f runtime-bundles/Dockerfile.cosyvoice \
-            -t aurora/cosyvoice2-cu128:0.1.4 "$RUNNER_TEMP/CosyVoice"
-          docker run --rm --entrypoint python aurora/cosyvoice2-cu128:0.1.4 -c \
-            "import torch; a=torch.cuda.get_arch_list(); print(a); assert 'sm_86' in a, 'PyTorch runtime lacks RTX 3060 (sm_86) kernels'"
-      - name: Pull the published DuiX image by immutable digest
+          docker build --pull --build-arg COSYVOICE_COMMIT="$COSYVOICE_COMMIT" -f runtime-bundles/Dockerfile.cosyvoice -t aurora/cosyvoice2-cu128:0.1.4 "$RUNNER_TEMP/CosyVoice"
+          docker run --rm --entrypoint python aurora/cosyvoice2-cu128:0.1.4 -c "import torch; a=torch.cuda.get_arch_list(); print(a); assert 'sm_86' in a, 'PyTorch runtime lacks RTX 3060 (sm_86) kernels'"
+      - name: Export CosyVoice runtime image
         shell: bash
         run: |
           set -euo pipefail
-          docker pull wupeiqi/duix@sha256:f8298e12e12c29b24c5d428a860d7db3f1ff3fa0ced87447da9b072e387ef341
-          docker tag wupeiqi/duix@sha256:f8298e12e12c29b24c5d428a860d7db3f1ff3fa0ced87447da9b072e387ef341 wupeiqi/duix:latest
-          docker image inspect wupeiqi/duix:latest
-      - name: Export runtime images as split GitHub assets
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker save aurora/cosyvoice2-cu128:0.1.4 | gzip -1 > "$ASSET_DIR/cosyvoice-image.tar.gz"
+          docker save aurora/cosyvoice2-cu128:0.1.4 | gzip -1 > "$RUNNER_TEMP/cosyvoice-image.tar.gz"
+          split -d -a 3 -b 1800M "$RUNNER_TEMP/cosyvoice-image.tar.gz" "$ASSET_DIR/cosyvoice-image.part-"
+          rm "$RUNNER_TEMP/cosyvoice-image.tar.gz"
           docker image rm aurora/cosyvoice2-cu128:0.1.4
-          docker save wupeiqi/duix:latest | gzip -1 > "$ASSET_DIR/duix-image.tar.gz"
-          for name in cosyvoice-image duix-image; do
-            split -d -a 3 -b 1800M "$ASSET_DIR/$name.tar.gz" "$ASSET_DIR/$name.part-"
-            rm "$ASSET_DIR/$name.tar.gz"
-          done
-      - name: Download pinned CosyVoice2 model files
+          docker builder prune -af
+          docker system prune -af
+      - name: Pull and export official DuiX image compatible with RTX 30/40 series
+        shell: bash
+        run: |
+          set -euo pipefail
+          image='guiji2025/duix.avatar:0.1.0_sdk_slim'
+          docker pull 'guiji2025/duix.avatar@sha256:1970424d219cbb6aebc7566f069041f057ccad618a395139dce002e1fb25d5ed'
+          docker tag 'guiji2025/duix.avatar@sha256:1970424d219cbb6aebc7566f069041f057ccad618a395139dce002e1fb25d5ed' "$image"
+          docker image inspect "$image" --format '{{.Os}}/{{.Architecture}} {{.Id}}'
+          docker save "$image" | gzip -1 > "$RUNNER_TEMP/duix-image.tar.gz"
+          split -d -a 3 -b 1800M "$RUNNER_TEMP/duix-image.tar.gz" "$ASSET_DIR/duix-image.part-"
+          rm "$RUNNER_TEMP/duix-image.tar.gz"
+          docker image rm "$image"
+          docker system prune -af
+      - name: Download pinned CosyVoice2 model files and licenses
         shell: bash
         run: |
           set -euo pipefail
@@ -64,7 +67,8 @@ jobs:
           import hashlib, json, os
           from pathlib import Path
           from huggingface_hub import snapshot_download
-          target = Path(os.environ['RUNNER_TEMP']) / 'CosyVoice2-0.5B'
+          root = Path(os.environ['RUNNER_TEMP'])
+          target = root / 'CosyVoice2-0.5B'
           revision = 'eec1ae6c79877dbd9379285cf8789c9e0879293d'
           required = [
               'campplus.onnx','configuration.json','cosyvoice2.yaml','flow.pt','hift.pt','llm.pt',
@@ -81,39 +85,58 @@ jobs:
               h = hashlib.sha256()
               with p.open('rb') as f:
                   for block in iter(lambda: f.read(8 * 1024 * 1024), b''): h.update(block)
-              records.append({'path': rel, 'size': p.stat().st_size, 'sha256': h.hexdigest()})
-          (Path(os.environ['RUNNER_TEMP']) / 'cosyvoice-model-manifest.json').write_text(
+              records.append({'path':rel,'size':p.stat().st_size,'sha256':h.hexdigest()})
+          (Path(os.environ['ASSET_DIR']) / 'cosyvoice-model-manifest.json').write_text(
               json.dumps({'repo':'FunAudioLLM/CosyVoice2-0.5B','revision':revision,'files':records},
-                         ensure_ascii=False, indent=2), encoding='utf-8')
-          (Path(os.environ['RUNNER_TEMP']) / 'cosyvoice-model-files.txt').write_text(
-              '\n'.join(required) + '\n', encoding='utf-8')
+                         ensure_ascii=False,indent=2),encoding='utf-8')
+          (root / 'cosyvoice-model-files.txt').write_text('\n'.join(required)+'\n',encoding='utf-8')
           PY
-          tar -C "$RUNNER_TEMP/CosyVoice2-0.5B" -czf "$ASSET_DIR/cosyvoice-models.tar.gz" -T "$RUNNER_TEMP/cosyvoice-model-files.txt"
-          cp "$RUNNER_TEMP/cosyvoice-model-manifest.json" "$ASSET_DIR/"
-          split -d -a 3 -b 1800M "$ASSET_DIR/cosyvoice-models.tar.gz" "$ASSET_DIR/cosyvoice-models.part-"
-          rm "$ASSET_DIR/cosyvoice-models.tar.gz"
-      - name: Write asset size and checksum manifest
+          tar -C "$RUNNER_TEMP/CosyVoice2-0.5B" -czf "$RUNNER_TEMP/cosyvoice-models.tar.gz" -T "$RUNNER_TEMP/cosyvoice-model-files.txt"
+          split -d -a 3 -b 1800M "$RUNNER_TEMP/cosyvoice-models.tar.gz" "$ASSET_DIR/cosyvoice-models.part-"
+          rm "$RUNNER_TEMP/cosyvoice-models.tar.gz"
+          curl -fsSL 'https://raw.githubusercontent.com/duixcom/Duix-Avatar/1328feb5871448c8fa3d0e45b3bbc87e7c1d458a/LICENSE' -o "$ASSET_DIR/DUIX-LICENSE.txt"
+          printf '%s\n' 'DUIX.COM is licensed under the DUIX.COM Community License, Copyright © DUIX.COM Platforms, Inc. All Rights Reserved.' > "$ASSET_DIR/DUIX-NOTICE.txt"
+          curl -fsSL 'https://www.apache.org/licenses/LICENSE-2.0.txt' -o "$ASSET_DIR/COSYVOICE-APACHE-2.0.txt"
+          cat > "$ASSET_DIR/THIRD-PARTY-NOTICE.md" <<'EOF'
+          # Third-party runtime notices
+          
+          - DuiX.Avatar: redistributed under the included DUIX.COM Community License. This product is built with DUIX.COM. The license requires the attribution notice and the prominent phrase “Built with DUIX.COM”. It also requires a commercial license above the stated 1,000 monthly active user threshold. See DUIX-LICENSE.txt.
+          - CosyVoice2 model: the pinned FunAudioLLM/CosyVoice2-0.5B revision declares Apache-2.0 on its model card. See COSYVOICE-APACHE-2.0.txt and cosyvoice-model-manifest.json.
+          EOF
+      - name: Write asset checksums and runtime manifest
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import hashlib, json, os
           from pathlib import Path
-          root = Path(os.environ['ASSET_DIR'])
-          assets = []
-          for p in sorted(root.glob('*.part-*')):
-              h = hashlib.sha256()
+          root=Path(os.environ['ASSET_DIR'])
+          def digest(p):
+              h=hashlib.sha256()
               with p.open('rb') as f:
-                  for block in iter(lambda: f.read(8 * 1024 * 1024), b''): h.update(block)
-              assets.append({'name':p.name,'size':p.stat().st_size,'sha256':h.hexdigest()})
-          manifest = {'product':'AuroraStudio','version':'0.1.4','cosyvoice_commit':os.environ['COSYVOICE_COMMIT'],
-                      'duix_image':'wupeiqi/duix:latest',
-                      'duix_digest':'sha256:f8298e12e12c29b24c5d428a860d7db3f1ff3fa0ced87447da9b072e387ef341',
-                      'cosyvoice_image':'aurora/cosyvoice2-cu128:0.1.4',
-                      'cosyvoice_model_manifest':'cosyvoice-model-manifest.json','assets':assets}
+                  for block in iter(lambda:f.read(8*1024*1024),b''):h.update(block)
+              return h.hexdigest(),p.stat().st_size
+          def bundle(prefix,image):
+              parts=sorted(root.glob(prefix+'.part-*'))
+              full=hashlib.sha256(); size=0
+              for p in parts:
+                  h,_=digest(p); data=p.read_bytes(); full.update(data); size+=len(data)
+              return {'image':image,'parts':[p.name for p in parts],'size':size,'sha256':full.hexdigest()}
+          duix=bundle('duix-image','guiji2025/duix.avatar:0.1.0_sdk_slim')
+          cosy=bundle('cosyvoice-image','aurora/cosyvoice2-cu128:0.1.4')
+          model=bundle('cosyvoice-models','')
+          assets=[]
+          for p in sorted(root.iterdir()):
+              if p.name=='manifest.json' or not p.is_file(): continue
+              h,size=digest(p); assets.append({'name':p.name,'size':size,'sha256':h})
+          for p in sorted(root.glob('*.part-*')):
+              h,size=digest(p); assets.append({'name':p.name,'size':size,'sha256':h})
+          manifest={'product':'AuroraStudio','version':'0.1.4',
+                    'cosyvoice_commit':os.environ['COSYVOICE_COMMIT'],
+                    'bundles':{'cosyvoice_image':cosy,'duix_image':duix,'cosyvoice_models':model},
+                    'assets':assets}
           (root/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
-          sums = ''.join(f"{x['sha256']}  {x['name']}\n" for x in assets)
-          (root/'SHA256SUMS.txt').write_text(sums,encoding='ascii')
+          (root/'SHA256SUMS.txt').write_text(''.join(f"{a['sha256']}  {a['name']}\n" for a in assets),'ascii')
           PY
       - name: Publish draft runtime release for acceptance
         env:
@@ -123,10 +146,10 @@ jobs:
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/release-notes.md" <<'EOF'
-          Aurora 0.1.4 runtime bundle acceptance assets.
-
-          Includes a pinned DuiX image, a CosyVoice2 runtime image, and the required CosyVoice2 model files. Assets are split below 2 GB each and include SHA-256 metadata.
-
-          This is a draft acceptance release. Validate installation and real RTX 3060 inference before publishing it for customers.
+          Aurora Studio 0.1.4 runtime bundle acceptance assets.
+          
+          Includes pinned, prebuilt DuiX and CosyVoice runtime images and the selected CosyVoice2 model files. Each large bundle is split into resumable, SHA-256-verified GitHub Release assets. Existing verified local components are reused.
+          
+          This is a draft acceptance release. Validate download, install, and real RTX 3060 inference before making it the customer release.
           EOF
           gh release create "$RELEASE_TAG" "$ASSET_DIR"/* --draft --title "极光片场运行组件 0.1.4 验收包" --notes-file "$RUNNER_TEMP/release-notes.md" --target "$GITHUB_SHA"
