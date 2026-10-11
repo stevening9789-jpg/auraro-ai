@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Draft GitHub Release tag for runtime acceptance assets
+        description: Versioned public release tag for 0.1.4 runtime assets
         required: true
-        default: aurora-runtime-v0.1.4-rc1
+        default: aurora-runtime-v0.1.4
 permissions:
   contents: write
 
@@ -52,7 +52,9 @@ jobs:
           image='guiji2025/duix.avatar:0.1.0_sdk_slim'
           docker pull 'guiji2025/duix.avatar@sha256:1970424d219cbb6aebc7566f069041f057ccad618a395139dce002e1fb25d5ed'
           docker tag 'guiji2025/duix.avatar@sha256:1970424d219cbb6aebc7566f069041f057ccad618a395139dce002e1fb25d5ed' "$image"
-          docker image inspect "$image" --format '{{.Os}}/{{.Architecture}} {{.Id}}'
+          platform=$(docker image inspect "$image" --format '{{.Os}}/{{.Architecture}}')
+          test "$platform" = 'linux/amd64'
+          docker image inspect "$image" --format '{{.Id}}'
           docker save "$image" | gzip -1 > "$RUNNER_TEMP/duix-image.tar.gz"
           split -d -a 3 -b 1800M "$RUNNER_TEMP/duix-image.tar.gz" "$ASSET_DIR/duix-image.part-"
           rm "$RUNNER_TEMP/duix-image.tar.gz"
@@ -132,14 +134,16 @@ jobs:
           for p in sorted(root.iterdir()):
               if p.name=='manifest.json' or not p.is_file(): continue
               h,size=digest(p); assets.append({'name':p.name,'size':size,'sha256':h})
-          manifest={'product':'AuroraStudio','version':'0.1.4',
+          if not cosy['parts'] or not duix['parts'] or not model['parts']:
+              raise SystemExit('runtime bundle export produced no split assets')
+          manifest={'product':'AuroraStudio','version':'0.1.4','architecture':'windows-x64 host / linux-amd64 containers',
                     'cosyvoice_commit':os.environ['COSYVOICE_COMMIT'],
                     'bundles':{'cosyvoice_image':cosy,'duix_image':duix,'cosyvoice_models':model},
                     'assets':assets}
           (root/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
           (root/'SHA256SUMS.txt').write_text(''.join(f"{a['sha256']}  {a['name']}\n" for a in assets),'ascii')
           PY
-      - name: Publish draft runtime release for acceptance
+      - name: Publish versioned runtime release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
@@ -147,10 +151,10 @@ jobs:
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/release-notes.md" <<'EOF'
-          Aurora Studio 0.1.4 runtime bundle acceptance assets.
+          Aurora Studio 0.1.4 runtime components.
           
           Includes pinned, prebuilt DuiX and CosyVoice runtime images and the selected CosyVoice2 model files. Each large bundle is split into resumable, SHA-256-verified GitHub Release assets. Existing verified local components are reused.
           
-          This is a draft acceptance release. Validate download, install, and real RTX 3060 inference before making it the customer release.
+          DuiX documents compatibility with RTX 30/40 series on CUDA 12.8; CosyVoice's PyTorch runtime includes RTX 3060 kernels. Hardware-specific generation still requires acceptance on the target PC. DuiX community-license attribution and threshold terms are included in the assets.
           EOF
-          gh release create "$RELEASE_TAG" "$ASSET_DIR"/* --draft --title "极光片场运行组件 0.1.4 验收包" --notes-file "$RUNNER_TEMP/release-notes.md" --target "$GITHUB_SHA"
+          gh release create "$RELEASE_TAG" "$ASSET_DIR"/* --title "极光片场运行组件 0.1.4" --notes-file "$RUNNER_TEMP/release-notes.md" --target "$GITHUB_SHA"
