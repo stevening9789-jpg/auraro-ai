@@ -1,6 +1,10 @@
 name: Build Aurora 0.1.4 runtime bundles
 
 on:
+  push:
+    paths:
+      - .github/workflows/build-runtime-bundles.yml
+      - runtime-bundles/**
   workflow_dispatch:
     inputs:
       release_tag:
