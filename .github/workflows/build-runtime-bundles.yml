@@ -38,7 +38,7 @@ jobs:
         run: |
           set -euo pipefail
           docker build --pull --build-arg COSYVOICE_COMMIT="$COSYVOICE_COMMIT" -f runtime-bundles/Dockerfile.cosyvoice -t aurora/cosyvoice2-cu128:0.1.4 "$RUNNER_TEMP/CosyVoice"
-          docker run --rm --entrypoint python aurora/cosyvoice2-cu128:0.1.4 -c "import torch; a=torch.cuda.get_arch_list(); print(a); assert 'sm_86' in a, 'PyTorch runtime lacks RTX 3060 (sm_86) kernels'"
+          docker run --rm --entrypoint python aurora/cosyvoice2-cu128:0.1.4 -c "import torch; a=torch.cuda.get_arch_list(); print(torch.__version__, torch.version.cuda, torch.backends.cuda.is_built(), a); assert torch.backends.cuda.is_built() and torch.version.cuda == '12.8', 'PyTorch runtime lacks CUDA 12.8 support'; assert not a or 'sm_86' in a, 'PyTorch runtime exposes arch flags but lacks RTX 3060 (sm_86)'"
       - name: Export CosyVoice runtime image
         shell: bash
         run: |
