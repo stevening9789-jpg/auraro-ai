@@ -154,6 +154,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          RELEASE_TAG="${RELEASE_TAG:-aurora-runtime-v0.1.4}"
           cat > "$RUNNER_TEMP/release-notes.md" <<'EOF'
           Aurora Studio 0.1.4 runtime components.
           
